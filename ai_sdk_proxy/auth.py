@@ -152,13 +152,6 @@ def _verify_signature(token: str, jwks_uri: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Access control — required Okta group
-# ---------------------------------------------------------------------------
-
-# Users must be assigned to this Okta app/group to use the proxy.
-# Override via AI_SDK_REQUIRED_GROUP env var if your group name differs.
-_REQUIRED_GROUP = os.environ.get("AI_SDK_REQUIRED_GROUP", "AI-Portal-Users")
-
 def validate_and_extract(token: str, jwks_url: Optional[str] = None) -> dict:
     """
     Validate a JWT and extract identity claims.
@@ -205,13 +198,6 @@ def validate_and_extract(token: str, jwks_url: Optional[str] = None) -> dict:
         payload.get("cognito:groups", [])   # Cognito
         or payload.get("groups", [])        # Okta groups claim
     )
-
-    # Enforce Okta group membership — user must be assigned to the AI Portal app
-    if idp == "okta" and _REQUIRED_GROUP not in groups:
-        raise ProxyAuthError(
-            f"Access denied — your account is not assigned to the '{_REQUIRED_GROUP}' "
-            f"Okta app. Contact your IT admin to request access."
-        )
 
     # Extract identity — field names differ slightly between IDPs
     identity = {
