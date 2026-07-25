@@ -34,6 +34,7 @@ import os
 import threading
 import time
 import logging
+from pathlib import Path
 from typing import Callable, Optional
 
 import boto3
@@ -43,6 +44,10 @@ from .audit import AuditPublisher
 from .exceptions import ProxyAuthError, ProxyConfigError
 
 logger = logging.getLogger(__name__)
+
+# Default audit SNS topic — used when no sns_topic_arn is passed.
+# Override via AI_SDK_AUDIT_TOPIC_ARN env var or pass explicitly to the constructor.
+_DEFAULT_AUDIT_TOPIC_ARN = "arn:aws:sns:us-west-2:025066239748:ai-sdk-proxy-audit"
 
 # Friendly model aliases → Bedrock inference profile IDs
 _MODEL_ALIASES = {
@@ -87,11 +92,7 @@ class BedrockRuntimeClient:
         self._caller = caller
         self._region = region_name
 
-        topic_arn = sns_topic_arn or os.environ.get("AI_SDK_AUDIT_TOPIC_ARN")
-        if not topic_arn:
-            raise ProxyConfigError(
-                "sns_topic_arn is required. Pass it directly or set AI_SDK_AUDIT_TOPIC_ARN env var."
-            )
+        topic_arn = sns_topic_arn or os.environ.get("AI_SDK_AUDIT_TOPIC_ARN") or _DEFAULT_AUDIT_TOPIC_ARN
         self._audit = AuditPublisher(sns_topic_arn=topic_arn, region_name=region_name)
 
         # Resolve identity once at construction — cached for the lifetime of the client.
@@ -440,6 +441,7 @@ class BedrockRuntimeClient:
         Reads cached tokens from ~/.ai_sdk/session.json (written by `ai-sdk login`).
         Identity is resolved once here; auto-refreshes silently when token expires.
 
+        sns_topic_arn is optional — defaults to the platform audit topic.
         Run `ai-sdk login` first.
         """
         from .session import AISdkSession
@@ -448,7 +450,7 @@ class BedrockRuntimeClient:
 
         return cls(
             token_provider=sdk_session.get_token,
-            sns_topic_arn=sns_topic_arn,
+            sns_topic_arn=sns_topic_arn,  # None → falls back to _DEFAULT_AUDIT_TOPIC_ARN
             region_name=region_name,
             caller=caller,
         )

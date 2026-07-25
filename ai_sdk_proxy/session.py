@@ -3,18 +3,23 @@ Session management for AI SDK Proxy.
 
 Handles token storage, refresh, and the developer-facing login command.
 
-Supports two IDPs:
-  - Cognito  : username + password (developer accounts)
-  - Okta     : PKCE Authorization Code flow (browser-based, no client secret)
+Single login command covers everything:
+  ai-sdk login                    # lists available SSO profiles to pick from
+  ai-sdk login --profile my-prof  # uses specific AWS SSO profile
+
+This runs `aws sso login` for the chosen profile (opens browser → Okta once),
+then extracts the Okta JWT from the SSO OIDC cache and stores both:
+  - AWS credentials  → managed by AWS CLI in ~/.aws/sso/cache/
+  - Okta JWT        → cached in ~/.ai_sdk/session.json
 
 Session file: ~/.ai_sdk/session.json
 
 CLI usage:
-    python3 -m ai_sdk_proxy.session login              # Cognito (password)
-    python3 -m ai_sdk_proxy.session login --idp okta   # Okta (browser PKCE)
-    python3 -m ai_sdk_proxy.session logout
-    python3 -m ai_sdk_proxy.session whoami
-    python3 -m ai_sdk_proxy.session token
+    ai-sdk login                    # pick profile interactively
+    ai-sdk login --profile <name>   # use specific profile
+    ai-sdk logout
+    ai-sdk whoami
+    ai-sdk token
 
 Programmatic usage:
     from ai_sdk_proxy.session import AISdkSession
@@ -23,11 +28,13 @@ Programmatic usage:
 """
 
 import base64
+import configparser
 import hashlib
 import json
 import os
 import secrets
 import ssl
+import subprocess
 import sys
 import time
 import getpass
@@ -55,12 +62,213 @@ logger = logging.getLogger(__name__)
 SESSION_DIR  = Path.home() / ".ai_sdk"
 SESSION_FILE = SESSION_DIR / "session.json"
 
-# Okta app config
-OKTA_CLIENT_ID   = os.environ.get("AI_SDK_OKTA_CLIENT_ID",  "0oa15lz3fbyt0FGVZ698")
-OKTA_ISSUER      = os.environ.get("AI_SDK_OKTA_ISSUER",     "https://trial-5417186.okta.com/oauth2/default")
-OKTA_REDIRECT    = os.environ.get("AI_SDK_OKTA_REDIRECT",   "http://localhost:8765/callback")
-OKTA_SCOPES      = "openid profile email offline_access"
-CALLBACK_PORT    = 8765
+# Okta app config.
+# Resolution order:
+#   1. Environment variable (AI_SDK_OKTA_CLIENT_ID / AI_SDK_OKTA_ISSUER)
+#   2. AWS SSO session cache (~/.aws/sso/cache/) — custom fields set by IT
+#   3. AWS config profile — ai_sdk_okta_client_id / ai_sdk_okta_issuer fields
+#   4. None — login will give a clear error
+OKTA_REDIRECT = os.environ.get("AI_SDK_OKTA_REDIRECT", "http://localhost:8765/callback")
+OKTA_SCOPES   = "openid profile email offline_access"
+CALLBACK_PORT = 8765
+
+
+# ---------------------------------------------------------------------------
+# AWS SSO profile helpers
+# ---------------------------------------------------------------------------
+
+def _list_sso_profiles() -> list[dict]:
+    """
+    Parse ~/.aws/config and return all profiles that have SSO configured.
+    Handles both formats:
+      - New style (AWS CLI v2): profile has sso_session = <name>,
+        actual start_url is in [sso-session <name>] section
+      - Old style: profile has sso_start_url directly
+    """
+    config_file = Path.home() / ".aws" / "config"
+    if not config_file.exists():
+        return []
+
+    # Use RawConfigParser with a non-standard default_section so [default]
+    # is treated as a regular section instead of Python's special DEFAULT fallback
+    config = configparser.RawConfigParser()
+    config.default_section = "__unused_default__"
+    config.read(config_file)
+
+    # Build a lookup of sso-session name → start_url + region
+    sso_sessions: dict[str, dict] = {}
+    for section in config.sections():
+        if section.startswith("sso-session "):
+            session_name = section[len("sso-session "):]
+            sso_sessions[session_name] = {
+                "sso_start_url": config.get(section, "sso_start_url", fallback=""),
+                "sso_region":    config.get(section, "sso_region",    fallback="us-east-1"),
+            }
+
+    profiles = []
+    for section in config.sections():
+        if section == "default":
+            name = "default"
+        elif section.startswith("profile "):
+            name = section[len("profile "):]
+        else:
+            continue
+
+        # Resolve start_url — new style via sso_session reference, old style inline
+        sso_session_name = config.get(section, "sso_session", fallback=None)
+        if sso_session_name and sso_session_name in sso_sessions:
+            start_url  = sso_sessions[sso_session_name]["sso_start_url"]
+            sso_region = sso_sessions[sso_session_name]["sso_region"]
+        else:
+            start_url  = config.get(section, "sso_start_url", fallback=None)
+            sso_region = config.get(section, "sso_region",    fallback="us-east-1")
+
+        if not start_url:
+            continue  # not an SSO profile
+
+        profiles.append({
+            "name":                   name,
+            "sso_start_url":          start_url,
+            "sso_account_id":         config.get(section, "sso_account_id", fallback=""),
+            "sso_role_name":          config.get(section, "sso_role_name",  fallback=""),
+            "sso_region":             sso_region,
+            "ai_sdk_okta_client_id":  config.get(section, "ai_sdk_okta_client_id", fallback=None),
+            "ai_sdk_okta_issuer":     config.get(section, "ai_sdk_okta_issuer",     fallback=None),
+        })
+
+    return profiles
+
+
+def _pick_profile(profile_name: Optional[str]) -> dict:
+    """
+    Resolve a profile by name, or prompt the user to pick one interactively.
+    Raises ProxyAuthError if no SSO profiles exist.
+    """
+    profiles = _list_sso_profiles()
+    if not profiles:
+        raise ProxyAuthError(
+            "No AWS SSO profiles found in ~/.aws/config.\n"
+            "Ask your IT team to set up your AWS SSO profile, then re-run ai-sdk login."
+        )
+
+    if profile_name:
+        match = next((p for p in profiles if p["name"] == profile_name), None)
+        if not match:
+            names = ", ".join(p["name"] for p in profiles)
+            raise ProxyAuthError(
+                f"Profile '{profile_name}' not found. Available SSO profiles: {names}"
+            )
+        return match
+
+    if len(profiles) == 1:
+        print(f"Using SSO profile: {profiles[0]['name']}")
+        return profiles[0]
+
+    # Multiple profiles — let user pick
+    print("Available AWS SSO profiles:")
+    for i, p in enumerate(profiles, 1):
+        print(f"  {i}. {p['name']}  ({p['sso_role_name']} @ {p['sso_account_id']})")
+    while True:
+        try:
+            choice = int(input(f"Select profile [1-{len(profiles)}]: ").strip())
+            if 1 <= choice <= len(profiles):
+                return profiles[choice - 1]
+        except (ValueError, KeyboardInterrupt):
+            pass
+        print(f"  Enter a number between 1 and {len(profiles)}")
+
+
+def _run_aws_sso_login(profile_name: str) -> bool:
+    """
+    Run `aws sso login --profile <name>` as a subprocess.
+    Returns True on success.
+    """
+    print(f"\nRunning: aws sso login --profile {profile_name}")
+    print("A browser window will open for authentication ...\n")
+    result = subprocess.run(
+        ["aws", "sso", "login", "--profile", profile_name],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _okta_jwt_from_sso_cache(profile: dict) -> Optional[str]:
+    """
+    After `aws sso login`, the AWS CLI stores OIDC tokens in ~/.aws/sso/cache/.
+    Find the token file matching this profile's start_url and extract the id_token.
+    Returns the raw JWT string or None if not found.
+    """
+    sso_cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not sso_cache_dir.exists():
+        return None
+
+    start_url = profile.get("sso_start_url", "")
+
+    # Walk all cache files, find the one for this start_url with a valid token
+    for cache_file in sorted(sso_cache_dir.glob("*.json"),
+                             key=lambda f: f.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(cache_file.read_text())
+            if data.get("startUrl") != start_url:
+                continue
+            id_token = data.get("idToken") or data.get("id_token")
+            if id_token:
+                logger.debug("Found Okta JWT in SSO cache: %s", cache_file.name)
+                return id_token
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return None
+
+
+def _okta_config_from_sso_cache() -> tuple[Optional[str], Optional[str]]:
+    """
+    Read Okta client_id and issuer from the most recently written AWS SSO cache file
+    that contains custom ai_sdk_* fields (set by IT in the AWS config profile).
+    Falls back to None if not found.
+    """
+    sso_cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not sso_cache_dir.exists():
+        return None, None
+
+    for cache_file in sorted(sso_cache_dir.glob("*.json"),
+                             key=lambda f: f.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(cache_file.read_text())
+            client_id = data.get("ai_sdk_okta_client_id")
+            issuer    = data.get("ai_sdk_okta_issuer")
+            if client_id and issuer:
+                logger.debug("Okta config loaded from SSO cache: %s", cache_file.name)
+                return client_id, issuer
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return None, None
+
+
+def _resolve_okta_config(profile: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve Okta client_id and issuer with fallback chain:
+      1. Environment variables
+      2. AWS config profile fields (ai_sdk_okta_client_id / ai_sdk_okta_issuer)
+      3. AWS SSO cache
+    """
+    client_id = os.environ.get("AI_SDK_OKTA_CLIENT_ID")
+    issuer    = os.environ.get("AI_SDK_OKTA_ISSUER")
+    if client_id and issuer:
+        return client_id, issuer
+
+    if profile:
+        client_id = profile.get("ai_sdk_okta_client_id")
+        issuer    = profile.get("ai_sdk_okta_issuer")
+        if client_id and issuer:
+            return client_id, issuer
+
+    return _okta_config_from_sso_cache()
+
+
+# Module-level resolution without a profile — for non-login uses
+OKTA_CLIENT_ID, OKTA_ISSUER = _resolve_okta_config()
 
 
 # ---------------------------------------------------------------------------
@@ -406,54 +614,114 @@ class AISdkSession:
 # ---------------------------------------------------------------------------
 
 def cmd_login(args: list) -> int:
-    """Interactive login.
-
-    Default (no flags): Okta browser PKCE — just be in the Okta group, no client ID needed.
-    --idp cognito     : Cognito username + password (for service accounts / CI).
     """
-    idp = "okta"  # Okta is the default for regular users
+    Unified login — runs aws sso login for the chosen profile (opens browser once),
+    then extracts and caches the Okta JWT from the SSO result.
+
+    Usage:
+      ai-sdk login                    # pick from available SSO profiles
+      ai-sdk login --profile <name>   # use a specific profile
+      ai-sdk login --idp cognito      # Cognito username+password (CI/service accounts)
+    """
     if "--idp" in args:
         idx = args.index("--idp")
         idp = args[idx + 1] if idx + 1 < len(args) else "okta"
+        if idp == "cognito":
+            return _cmd_login_cognito()
 
-    if idp == "cognito":
-        return _cmd_login_cognito()
-    return _cmd_login_okta()
+    profile_name = None
+    if "--profile" in args:
+        idx = args.index("--profile")
+        profile_name = args[idx + 1] if idx + 1 < len(args) else None
+
+    return _cmd_login_sso(profile_name)
 
 
-def _cmd_login_okta() -> int:
-    """Okta PKCE browser login — no client secret, no password prompt."""
-    print(f"Logging in via Okta ...")
-    print(f"Issuer : {OKTA_ISSUER}")
-    print(f"Client : {OKTA_CLIENT_ID}\n")
+def _cmd_login_sso(profile_name: Optional[str]) -> int:
+    """
+    Unified SSO + Okta login.
+    1. Picks/confirms the AWS SSO profile.
+    2. Runs `aws sso login --profile <name>` (opens browser → Okta).
+    3. Extracts the Okta JWT from the SSO OIDC cache.
+    4. Falls back to standalone PKCE flow if JWT not in SSO cache.
+    5. Saves session to ~/.ai_sdk/session.json.
+    """
     try:
-        tokens = _okta_login_browser()
-        session = {
-            "id_token":     tokens["id_token"],
-            "access_token": tokens["access_token"],
-            "refresh_token": tokens.get("refresh_token", ""),
-            "expiry":       int(time.time()) + tokens.get("expires_in", 3600),
-            "client_id":    OKTA_CLIENT_ID,
-            "issuer":       OKTA_ISSUER,
-            "idp":          "okta",
-        }
-        _save_session(session)
-
-        # Decode email from id_token payload for display
-        import base64 as _b64
-        parts   = tokens["id_token"].split(".")
-        padding = "=" * (-len(parts[1]) % 4)
-        payload = json.loads(_b64.urlsafe_b64decode(parts[1] + padding))
-        email   = payload.get("email") or payload.get("sub", "unknown")
-
-        print(f"\nLogged in as : {email}")
-        print(f"IDP          : Okta")
-        print(f"Expires      : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session['expiry']))}")
-        print(f"Session saved: {SESSION_FILE}")
-        return 0
+        profile = _pick_profile(profile_name)
     except ProxyAuthError as e:
-        print(f"Okta login failed: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    # Step 1: aws sso login
+    if not _run_aws_sso_login(profile["name"]):
+        print("AWS SSO login failed. Please try again.", file=sys.stderr)
+        return 1
+
+    # Step 2: try to get Okta JWT from SSO cache
+    id_token = _okta_jwt_from_sso_cache(profile)
+
+    # Step 3: if SSO cache doesn't have id_token, fall back to standalone PKCE
+    if not id_token:
+        print("\nOkta JWT not found in SSO cache — running standalone Okta login ...")
+        okta_client_id, okta_issuer = _resolve_okta_config(profile)
+        if not okta_client_id or not okta_issuer:
+            print(
+                "Error: Okta client ID and issuer are not configured.\n"
+                "Add ai_sdk_okta_client_id and ai_sdk_okta_issuer to your AWS profile\n"
+                "or set AI_SDK_OKTA_CLIENT_ID and AI_SDK_OKTA_ISSUER env vars.",
+                file=sys.stderr,
+            )
+            return 1
+        # Temporarily override module-level globals for the PKCE flow
+        global OKTA_CLIENT_ID, OKTA_ISSUER
+        OKTA_CLIENT_ID = okta_client_id
+        OKTA_ISSUER    = okta_issuer
+        try:
+            tokens   = _okta_login_browser()
+            id_token = tokens.get("id_token")
+            refresh_token = tokens.get("refresh_token", "")
+            expires_in    = tokens.get("expires_in", 3600)
+        except ProxyAuthError as e:
+            print(f"Okta login failed: {e}", file=sys.stderr)
+            return 1
+    else:
+        refresh_token = ""
+        # Decode expiry from the JWT payload
+        try:
+            parts   = id_token.split(".")
+            padding = "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
+            expires_in = max(0, int(payload.get("exp", time.time() + 3600) - time.time()))
+        except Exception:
+            expires_in = 3600
+
+    # Step 4: decode and display identity
+    try:
+        parts   = id_token.split(".")
+        padding = "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
+        email   = payload.get("email") or payload.get("preferred_username") or payload.get("sub", "unknown")
+        issuer  = payload.get("iss", "")
+    except Exception:
+        email  = "unknown"
+        issuer = ""
+
+    session = {
+        "id_token":     id_token,
+        "refresh_token": refresh_token,
+        "expiry":       int(time.time()) + expires_in,
+        "idp":          "okta",
+        "issuer":       issuer,
+        "aws_profile":  profile["name"],
+    }
+    _save_session(session)
+
+    print(f"\nLogged in as : {email}")
+    print(f"AWS profile  : {profile['name']}")
+    print(f"IDP          : Okta (via AWS SSO)")
+    print(f"Expires      : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session['expiry']))}")
+    print(f"Session saved: {SESSION_FILE}")
+    return 0
 
 
 def _cmd_login_cognito() -> int:
@@ -537,23 +805,18 @@ _USAGE = """\
 AI SDK Proxy — session management
 
 Commands:
-  login            Authenticate via Okta (browser, no config needed — just be in the Okta group)
-  login --idp cognito  Authenticate via Cognito (username + password, for CI/service accounts)
-  logout           Clear the local session cache
-  token            Print current valid ID token (auto-refreshes). Use in scripts:
-                       export AI_SDK_JWT=$(ai-sdk token)
-  whoami           Show current logged-in user and token expiry
+  login                      Authenticate via AWS SSO + Okta (browser, one login for both)
+  login --profile <name>     Use a specific AWS SSO profile
+  login --idp cognito        Cognito username + password (for CI/service accounts)
+  logout                     Clear the local session cache
+  token                      Print current valid ID token (auto-refreshes)
+  whoami                     Show current logged-in user and token expiry
 
 Examples:
-  ai-sdk login            # opens browser → Okta login
-  ai-sdk whoami           # check who you are
-  ai-sdk logout           # clear session
-
-After login your code works automatically:
-  from ai_sdk_proxy import BedrockRuntimeClient
-  client = BedrockRuntimeClient.from_local_session(
-      sns_topic_arn="arn:aws:sns:...",
-  )
+  ai-sdk login                    # lists SSO profiles, pick one, browser opens
+  ai-sdk login --profile ai-dev   # use specific profile directly
+  ai-sdk whoami
+  ai-sdk logout
 """
 
 
