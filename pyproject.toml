@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-sdk-proxy"
+version = "0.1.0"
+description = "Drop-in Bedrock SDK proxy with Cognito auth and SNS audit"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.34.0",
+    "botocore>=1.34.0",
+    "certifi>=2024.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+ai-sdk = "ai_sdk_proxy.session:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_sdk_proxy*"]
