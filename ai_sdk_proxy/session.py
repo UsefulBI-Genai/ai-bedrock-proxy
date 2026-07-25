@@ -62,12 +62,11 @@ logger = logging.getLogger(__name__)
 SESSION_DIR  = Path.home() / ".ai_sdk"
 SESSION_FILE = SESSION_DIR / "session.json"
 
-# Okta app config.
-# Resolution order:
-#   1. Environment variable (AI_SDK_OKTA_CLIENT_ID / AI_SDK_OKTA_ISSUER)
-#   2. AWS SSO session cache (~/.aws/sso/cache/) — custom fields set by IT
-#   3. AWS config profile — ai_sdk_okta_client_id / ai_sdk_okta_issuer fields
-#   4. None — login will give a clear error
+# Okta app config — baked in defaults for this org.
+# Override via env vars or aws profile fields if needed.
+_OKTA_DEFAULT_CLIENT_ID = "0oa15lz3fbyt0FGVZ698"
+_OKTA_DEFAULT_ISSUER    = "https://trial-5417186.okta.com/oauth2/default"
+
 OKTA_REDIRECT = os.environ.get("AI_SDK_OKTA_REDIRECT", "http://localhost:8765/callback")
 OKTA_SCOPES   = "openid profile email offline_access"
 CALLBACK_PORT = 8765
@@ -249,22 +248,31 @@ def _okta_config_from_sso_cache() -> tuple[Optional[str], Optional[str]]:
 def _resolve_okta_config(profile: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
     """
     Resolve Okta client_id and issuer with fallback chain:
-      1. Environment variables
-      2. AWS config profile fields (ai_sdk_okta_client_id / ai_sdk_okta_issuer)
-      3. AWS SSO cache
+      1. Environment variables           — AI_SDK_OKTA_CLIENT_ID / AI_SDK_OKTA_ISSUER
+      2. AWS config profile fields       — ai_sdk_okta_client_id / ai_sdk_okta_issuer
+      3. AWS SSO cache                   — custom fields written by IT tooling
+      4. Baked-in org defaults           — always works after pip install, no config needed
     """
+    # 1. Env vars
     client_id = os.environ.get("AI_SDK_OKTA_CLIENT_ID")
     issuer    = os.environ.get("AI_SDK_OKTA_ISSUER")
     if client_id and issuer:
         return client_id, issuer
 
+    # 2. AWS config profile
     if profile:
         client_id = profile.get("ai_sdk_okta_client_id")
         issuer    = profile.get("ai_sdk_okta_issuer")
         if client_id and issuer:
             return client_id, issuer
 
-    return _okta_config_from_sso_cache()
+    # 3. SSO cache
+    client_id, issuer = _okta_config_from_sso_cache()
+    if client_id and issuer:
+        return client_id, issuer
+
+    # 4. Baked-in defaults — always available
+    return _OKTA_DEFAULT_CLIENT_ID, _OKTA_DEFAULT_ISSUER
 
 
 # Module-level resolution without a profile — for non-login uses
@@ -664,14 +672,6 @@ def _cmd_login_sso(profile_name: Optional[str]) -> int:
     if not id_token:
         print("\nOkta JWT not found in SSO cache — running standalone Okta login ...")
         okta_client_id, okta_issuer = _resolve_okta_config(profile)
-        if not okta_client_id or not okta_issuer:
-            print(
-                "Error: Okta client ID and issuer are not configured.\n"
-                "Add ai_sdk_okta_client_id and ai_sdk_okta_issuer to your AWS profile\n"
-                "or set AI_SDK_OKTA_CLIENT_ID and AI_SDK_OKTA_ISSUER env vars.",
-                file=sys.stderr,
-            )
-            return 1
         # Temporarily override module-level globals for the PKCE flow
         global OKTA_CLIENT_ID, OKTA_ISSUER
         OKTA_CLIENT_ID = okta_client_id
