@@ -362,3 +362,180 @@ client.close()
 ```
 
 App teams get observability, identity enforcement, and audit for free — with zero changes to their existing LLM call code.
+
+---
+
+## Flow 5: Internal Code-Level Flow (client.py)
+
+Detailed walkthrough of every layer inside the proxy — from construction through request, response, streaming, and async audit publish.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BedrockRuntimeClient                                │
+│                                                                             │
+│  Constructor (__init__ / from_local_session)                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  jwt / token_provider / jwks_url                                     │   │
+│  │          │                                                           │   │
+│  │          ▼                                                           │   │
+│  │   TokenManager  (auth.py)                                            │   │
+│  │          │                                                           │   │
+│  │          ▼                                                           │   │
+│  │   get_valid_token()                                                  │   │
+│  │          │                                                           │   │
+│  │   _decode_jwt_payload()  ◄── base64 decode (no network)             │   │
+│  │          │                                                           │   │
+│  │   expiry check  (time.time() vs exp)                                 │   │
+│  │          │                                                           │   │
+│  │   [expired?]──────────────────────[valid?]                          │   │
+│  │       │                                │                            │   │
+│  │  token_provider()                 return token                      │   │
+│  │  (silent refresh)                                                   │   │
+│  │          │                                                           │   │
+│  │          ▼                                                           │   │
+│  │   validate_and_extract()                                             │   │
+│  │          │                                                           │   │
+│  │   detect IDP from 'iss' claim                                        │   │
+│  │   cognito | okta | oidc                                              │   │
+│  │          │                                                           │   │
+│  │   _jwks_uri_for_issuer()                                             │   │
+│  │          │                                                           │   │
+│  │   _verify_signature() ──────────► JWKS fetch (1hr TTL cache)        │   │
+│  │          │                        network call on first use only     │   │
+│  │          ▼                                                           │   │
+│  │   identity dict cached  ◄── zero I/O after this point               │   │
+│  │   { user_id, email, username, idp, groups }                         │   │
+│  │                                                                     │   │
+│  │   sns_topic_arn ──► AuditPublisher  (audit.py)                      │   │
+│  │   boto3.client("bedrock-runtime") ──► self._bedrock                 │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+                    ┌──────── Request / Response Path ──────────────┐
+                    │                                               │
+     Caller         │   BedrockRuntimeClient method                 │
+       │            │                                               │
+       │  kwargs    │   1. _resolve_model(modelId)                  │
+       └──────────► │      alias → Bedrock inference profile ID     │
+                    │                                               │
+                    │   2. start = time.time()                      │
+                    │                                               │
+                    │   3. self._bedrock.<method>(**kwargs)         │
+                    │              │                                │
+                    │              ▼                                │
+                    │         AWS Bedrock Runtime                   │
+                    │              │                                │
+                    │              ▼                                │
+                    │         response ◄──────────────────────      │
+                    │              │                                │
+                    │   ┌──────────┴───────────────────────────┐   │
+                    │   │  Method-specific response preparation  │   │
+                    │   │                                       │   │
+                    │   │  invoke_model:                        │   │
+                    │   │    raw_body = body.read()             │   │
+                    │   │    body = BytesIO(raw_body)  ◄── re-wrap so caller can .read()
+                    │   │                                       │   │
+                    │   │  invoke_model_with_response_stream:   │   │
+                    │   │    wrap body in _TokenInterceptStream │   │
+                    │   │    (thin pass-through iterator)       │   │
+                    │   │                                       │   │
+                    │   │  converse / converse_stream:          │   │
+                    │   │    extract usage tokens from response │   │
+                    │   └───────────────────────────────────────┘   │
+                    │              │                                │
+                    │              ▼                                │
+                    │   return response  ◄── IMMEDIATE              │
+                    │              │                                │
+                    └──────────────┼────────────────────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────────────────────┐
+                    │   Background Thread  (daemon=True)              │
+                    │                                                 │
+                    │   _emit_async()                                 │
+                    │       │                                         │
+                    │       ▼                                         │
+                    │   _get_identity()  ← dict lookup, no I/O       │
+                    │   (refreshes only if token changed externally)  │
+                    │       │                                         │
+                    │       ▼                                         │
+                    │   AuditPublisher.publish()                      │
+                    │       │                                         │
+                    │       ▼                                         │
+                    │   Another daemon thread (_send)                 │
+                    │       │                                         │
+                    │       ▼                                         │
+                    │   SNS.publish(TopicArn, event JSON)             │
+                    │   {                                             │
+                    │     request_id, timestamp,                      │
+                    │     caller, user_id, email, username, idp,      │
+                    │     method, model_id,                           │
+                    │     input_tokens, output_tokens,                │
+                    │     latency_ms, status, error_code              │
+                    │   }                                             │
+                    └─────────────────────────────────────────────────┘
+
+
+─────────────────────────────────────────────────────────────────────────────
+  from_local_session()  —  CLI alternate constructor
+─────────────────────────────────────────────────────────────────────────────
+
+  AISdkSession  (session.py)
+       │
+       ▼
+  get_token()  ──►  ~/.ai_sdk/session.json
+                         │
+                   [not expired?]  ──►  return id_token
+                         │
+                   [expired?]
+                         │
+                  idp == "okta"?
+                      │          │
+               _okta_refresh()   cognito.initiate_auth()
+               Okta /v1/token    REFRESH_TOKEN_AUTH
+                      │          │
+               new id_token ◄────┘
+               _save_session()
+       │
+       ▼
+  token_provider = sdk_session.get_token
+  BedrockRuntimeClient.__init__()
+
+
+─────────────────────────────────────────────────────────────────────────────
+  Streaming flow  (_TokenInterceptStream)
+─────────────────────────────────────────────────────────────────────────────
+
+  for event in response["body"]:      ← caller iterates normally
+       │
+       ▼
+  _TokenInterceptStream.__iter__()
+       │
+       ├── parse chunk bytes (JSON)
+       │       message_start  → capture input_tokens
+       │       message_delta  → capture output_tokens
+       │
+       ├── yield event  ◄── chunk delivered to caller immediately, no buffering
+       │
+       └── [stream exhausted / finally block]
+               │
+               ▼
+           Thread: _emit_async(input_tokens, output_tokens)
+               │
+               ▼
+           SNS audit publish (fire-and-forget)
+
+
+─────────────────────────────────────────────────────────────────────────────
+  Error path  (any method)
+─────────────────────────────────────────────────────────────────────────────
+
+  self._bedrock.<method>() raises Exception
+       │
+       ▼
+  _emit_async(..., status="error", error_code=type(e).__name__)
+  (synchronous call here — no background thread on the error path)
+       │
+       ▼
+  raise  ← original exception re-raised to caller unchanged
+```

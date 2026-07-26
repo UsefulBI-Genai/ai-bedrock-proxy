@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Default audit SNS topic — used when no sns_topic_arn is passed.
 # Override via AI_SDK_AUDIT_TOPIC_ARN env var or pass explicitly to the constructor.
-_DEFAULT_AUDIT_TOPIC_ARN = "arn:aws:sns:us-west-2:025066239748:ai-sdk-proxy-audit"
+_DEFAULT_AUDIT_TOPIC_ARN = "arn:aws:sns:us-east-1:070977799526:ai-sdk-proxy-audit-dev"
 
 # Friendly model aliases → Bedrock inference profile IDs
 _MODEL_ALIASES = {
